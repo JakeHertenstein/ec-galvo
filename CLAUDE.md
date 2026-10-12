@@ -1,8 +1,9 @@
-# CLAUDE.md - MeerK40t Development Guide
+# ec-galvo
 
-**This file has been superseded.** All AI coding agent instructions for
-MeerK40t now live in the unified [AGENTS.md](AGENTS.md) at the repository root.
+Public, MIT. Driver only: no Epoch Cipher appliance code, card data, layouts,
+bundles or machine files belong here. Those live in the private `burner` repo.
 
-Please read and follow [AGENTS.md](AGENTS.md) instead — it is the single source
-of truth for project overview, architecture, development patterns, testing,
-and conventions.
+- Never log coordinates or packet contents. `tests/test_controller.py` checks this.
+- No silent fallbacks: out-of-range moves, bad .cor files and USB errors raise.
+- Keep `UPSTREAM.md` current when pulling more code from MeerK40t.
+- Checks: `ruff check ec_galvo tests && ruff format --check ec_galvo tests && pytest`.

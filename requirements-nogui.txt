@@ -1,7 +1,0 @@
-wheel
-Pillow
-pyusb
-pyserial
-numpy
-ezdxf
-requests>=2.25.0

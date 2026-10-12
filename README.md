@@ -1,59 +1,47 @@
-# Welcome to MeerK40t!
-MeerK40t (pronounced MeerKat) is a built-from-the-ground-up MIT licensed open-source laser cutting software.
+# ec-galvo
 
-The primary goals of this software is simple:
+A small Python driver for JCZ LMC (EZCAD2-era) galvo laser boards, USB vendor
+`0x9588` product `0x9899`, with a MOPA fiber source. Trimmed from MeerK40t's
+`balormk` driver (MIT). No GUI, no MeerK40t kernel, one dependency (`pyusb`).
 
+```python
+from ec_galvo import CorrectionTable, Field, GalvoController, MarkSettings, USBConnection
 
-* Provide users with high quality laser control software.
-* Provide developers with a highly extensible platform to help further their own ideas, and provide novel work to the laser community at large.
+cor = CorrectionTable.from_bytes(open("lens.cor", "rb").read())
+laser = GalvoController(USBConnection(), Field(size_mm=150.0), cor)
+laser.connect()
 
-## Getting started
-To get up and running, simply download Meerk40t from [here](https://github.com/meerk40t/meerk40t/releases) for your specific platform. (Windows, Mac OSX, Linux, and by extension, Raspberry Pi).
+laser.light_mode()                      # red-dot framing
+for x, y in [(10, 10), (60, 10), (60, 60), (10, 60), (10, 10)]:
+    laser.light_mm(x, y)
+laser.rapid_mode()
 
-## 🛠 Project Status: Maintenance Mode
-**MeerK40t is currently in a low-maintenance phase.** The original maintainers have limited bandwidth for active development. What this means for users and contributors:
-* **Response Times:** Issues and Pull Requests may not receive immediate feedback. Silence is not a lack of interest, but a lack of time.
-* **Weekly Builds:** These are automated experimental snapshots. They **will** contain bugs and regressions. If you require a stable experience, please stick to the [latest stable Release](https://github.com/meerk40t/meerk40t/releases).
-* **Contributions Welcome:** This project survives on community involvement. If you find a bug in a weekly build, the fastest way to get it fixed is to submit a Pull Request. 
-* **Support:** Please use the [Discussions] tab or community forums for general help, as the Issue tracker is reserved for actionable bug reports and development tasks.
+laser.program_mode()                    # marking
+laser.set_settings(MarkSettings(power_pct=40, speed_mm_s=1500, frequency_khz=60,
+                                pulse_width_ns=200, laser_on_delay_us=100,
+                                laser_off_delay_us=120, polygon_delay_us=50,
+                                jump_speed_mm_s=4000))
+laser.jump_mm(10, 10)
+laser.mark_mm(60, 10)
+laser.rapid_mode()                      # waits for the list to finish
+```
 
-<details>
-<summary>Release Versions (Just use the latest)</summary>
+`RecordingConnection` stands in for the board: it keeps every packet in memory
+and gives a readable command log for golden-file tests.
 
+## Behaviour that differs from MeerK40t
 
-> * 0.9 - Active - New features and some underlying architectural changes. Try the latest released version: [0.9.9000](https://github.com/meerk40t/meerk40t/releases/tag/0.9.9000) (Jan 17, 2026) or try a prerelease even: [release list](https://github.com/meerk40t/meerk40t/releases)
-> * 0.8 - Maintenance - may receive critical bugfixes but no more new features, latest version: [0.8.12](https://github.com/meerk40t/meerk40t/releases/tag/0.8.12000) (Oct 17, 2023)
-> * 0.7 - Discontinued - K40 support only (including ruidacontrol emulator for 3rd party lasersoftware integration), latest version [0.7.10](https://github.com/meerk40t/meerk40t/releases/tag/0.7.10000) (June 13, 2023)
-> * 0.6 - Discontinued - K40 support only, latest version: [0.6.24](https://github.com/meerk40t/meerk40t/releases/tag/0.6.24) (Oct 11, 2021)
+- Moves outside the lens field raise `OutOfFieldError` (MeerK40t skips them).
+- A bad `.cor` raises `CorrectionFileError` (MeerK40t loads a blank table).
+  Running uncorrected must be asked for with `CorrectionTable.no_correction()`.
+- USB errors raise; there is no silent reconnect mid-job, and no clone-board
+  firmware load.
+- The log never contains coordinates or packet contents.
+- Waits time out instead of spinning forever.
+- Fiber source only.
 
+## Tests
 
-</details>
+    pip install -e '.[test]' && pytest
 
-### Command Line Interface
-
-Meerk40t has an advanced internal console system allowing access to most parts of the code with various commands. It also provides a command line interface which should allow you to automate any processes. To learn more, download a version of Meerk40t for your platform, and execute it in a terminal with the ``--help`` argument to get a list of options.
-
-## Compiling from source
-
-Alternatively you can run MeerK40t directly from Python. `pip install meerk40t[all]` with python installed will usually be sufficient. Then merely run `meerk40t` at the command line.
-
-See [Install: Source wiki page](https://github.com/meerk40t/meerk40t/wiki/Install:-Source)
-
-The wxMeerK40t is the GUI and is written in wxPython. We use AUI to allow to have a very highly configurable UI. We can easily add panes and tools and there are quite a few available already.
-
-## Screenshots
-![grafik](https://github.com/user-attachments/assets/e56135a2-7b1f-44be-9761-b92931e300f6)
-
-## Drivers
-
-Meerk40t provides a variety of drivers with an extensible framework to provide support for other new laser devices. The code was written with the myriad of possibilities for different software in mind. For example, it may be essential that GRBL be able to reset an alarm or notify the user of particular error codes. The configuration for GRBL is not the same for the configuration of other laser control drivers. With this in mind, MeerK40t can radically change how and when it works
-
-
-### Supported devices
-*   Lihuiyu M2/M3-Nano (aka K40 lasers)
-*   Any GRBL device (Atomstack, Creality, Longer, Ortur etc...)
-*   Ezcad2-compatible JCZ controllers galvo lasers
-*   Moshiboard
-*   NewlyDraw System 8.1 Lasers
-*   Devices with Ruida-controller
-*   Ruida-Emulation (Middleman between Lightburn and K40)
+See `UPSTREAM.md` for where each file came from.
