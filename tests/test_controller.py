@@ -188,3 +188,23 @@ def test_field_corners_and_flips():
     assert Field(150.0, flip_x=True).to_board(0, 0) == (0xFFFF, 0)
     assert Field(150.0, swap_xy=True).to_board(150, 0) == (0, 0xFFFF)
     assert Field(150.0, offset_mm=(1.0, 0)).to_board(0, 0)[0] == round(0xFFFF / 150)
+
+
+def test_light_mode_sets_its_own_jump_speed():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.rapid_mode()
+    (speed,) = list_cmds(conn, p.listJumpSpeed)
+    assert speed.params[0] == c.field.speed(c.setup.light_speed_mm_s)
+
+
+def test_light_then_program_switches_back_to_job_jump_speed():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.program_mode()
+    c.jump_mm(20, 20)
+    c.rapid_mode()
+    speeds = [s.params[0] for s in list_cmds(conn, p.listJumpSpeed)]
+    assert speeds == [c.field.speed(3000.0), c.field.speed(2000.0)]

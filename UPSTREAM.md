@@ -23,6 +23,10 @@ Board start-up values (`BoardSetup`) are MeerK40t's device defaults.
 - MOPA pulse width goes out as `listFiberYLPMPulseWidth` (0x8026) with the
   value in ns, unconverted, as MeerK40t does. The phase 0 coupon confirms it.
 
+- Framing (`light_mode`) now sends its own jump speed (`BoardSetup.light_speed_mm_s`,
+  MeerK40t's `redlight_speed` default of 3000 mm/s). Upstream sets it from the
+  live-light job, which we did not keep.
+
 ## Not carried over
 
 GUI, kernel/service integration, CO2 and UV sources, clone-board firmware

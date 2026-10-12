@@ -59,6 +59,7 @@ class BoardSetup:
     open_mo_delay_ms: float = 8.0
     analog_port_1: int = 0x7FF
     default_jump_speed_mm_s: float = 2000.0
+    light_speed_mm_s: float = 3000.0  # red-dot framing (MeerK40t redlight_speed)
 
 
 @dataclass(frozen=True)
@@ -227,6 +228,7 @@ class GalvoController:
             self._port(MAIN_BIT, True)
             self.write_port()
             self.set_fiber_mo(1)
+            self.list_jump_speed(self.setup.default_jump_speed_mm_s)
             return
         self.mode = STATE_PROGRAM
         self.reset_list()
@@ -256,6 +258,9 @@ class GalvoController:
             self._port(MAIN_BIT, False)
             self._port(LIGHT_BIT, True)
             self.list_write_port()
+        # Upstream leaves this to the caller; without it framing runs at whatever
+        # speed the board last had.
+        self.list_jump_speed(self.setup.light_speed_mm_s)
         self.mode = STATE_LIGHT
 
     def rapid_mode(self):
