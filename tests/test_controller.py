@@ -208,3 +208,20 @@ def test_light_then_program_switches_back_to_job_jump_speed():
     c.rapid_mode()
     speeds = [s.params[0] for s in list_cmds(conn, p.listJumpSpeed)]
     assert speeds == [c.field.speed(3000.0), c.field.speed(2000.0)]
+
+
+def test_red_dot_is_off_after_framing_and_in_the_next_job():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.rapid_mode()
+    assert not c._port_bits & (1 << 8)
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.mark_mm(20, 20)
+    c.rapid_mode()
+    singles = [x for x in conn.commands() if not x.in_list and x.opcode == p.WritePort]
+    assert singles and all(not w.params[0] & (1 << 8) for w in singles)
+    ports = list_cmds(conn, p.listWritePort)
+    assert ports[0].params[0] & (1 << 8)  # framing list: on
+    assert all(not w.params[0] & (1 << 8) for w in ports[1:])  # marking list: off

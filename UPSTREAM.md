@@ -27,6 +27,9 @@ Board start-up values (`BoardSetup`) are MeerK40t's device defaults.
   MeerK40t's `redlight_speed` default of 3000 mm/s). Upstream sets it from the
   live-light job, which we did not keep.
 
+- Ending a list (`rapid_mode`) or aborting turns the red dot off. Upstream
+  leaves the light bit set, so the next marking list would run with it on.
+
 ## Not carried over
 
 GUI, kernel/service integration, CO2 and UV sources, clone-board firmware

@@ -276,6 +276,7 @@ class GalvoController:
         self.wait_idle()
         self.set_fiber_mo(0)
         self._port(MAIN_BIT, False)
+        self._light(False)  # upstream leaves the red dot on after framing
         self.write_port()
         self.mode = STATE_RAPID
 
@@ -293,6 +294,7 @@ class GalvoController:
         self._number_of_list_packets = 0
         self.set_fiber_mo(0)
         self._port(MAIN_BIT, False)
+        self._light(False)
         self.write_port()
         self.mode = STATE_RAPID
         self._log("aborted")
