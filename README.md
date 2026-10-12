@@ -21,7 +21,7 @@ laser.set_settings(MarkSettings(power_pct=40, speed_mm_s=1500, frequency_khz=60,
                                 pulse_width_ns=200, laser_on_delay_us=100,
                                 laser_off_delay_us=120, polygon_delay_us=50,
                                 jump_speed_mm_s=4000))
-laser.jump_mm(10, 10)
+laser.jump_mm(10, 10, force=True)
 laser.mark_mm(60, 10)
 laser.rapid_mode()                      # waits for the list to finish
 ```
@@ -37,7 +37,15 @@ and gives a readable command log for golden-file tests.
 - USB errors raise; there is no silent reconnect mid-job, and no clone-board
   firmware load.
 - The log never contains coordinates or packet contents.
-- Waits time out instead of spinning forever.
+- After every connect (including a reconnect) or an abort the galvo position is unknown, so the next move
+  must be a jump; abort tries every shutdown step and reports any that failed
+  (`AbortIncomplete`).
+- Waits (including a paused wait) poll an optional `stop_check` and only time
+  out when the board is neither busy nor ready; a board stuck at BUSY waits until
+  stopped.
+- Settings are checked on creation (`MarkSettings`, `BoardSetup`, `Field.speed`).
+- EZCad-style turn-angle words on corners and an 8 ms settle after frequency or
+  pulse-width changes (see UPSTREAM.md).
 - Fiber source only.
 
 ## Tests

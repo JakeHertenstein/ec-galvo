@@ -43,8 +43,9 @@ class Command:
 class RecordingConnection:
     serial: bytes = b"RECORDER"
     status_word: int = READY  # idle and ready to take a list
-    packets: list[bytes] = field(default_factory=list)
-    replies: deque[bytes] = field(default_factory=deque)  # queued replies override defaults
+    # repr=False: packets hold coordinates, which must never reach a log or traceback
+    packets: list[bytes] = field(default_factory=list, repr=False)
+    replies: deque[bytes] = field(default_factory=deque, repr=False)  # override defaults
     _open: bool = False
     _last_opcode: int | None = None
 

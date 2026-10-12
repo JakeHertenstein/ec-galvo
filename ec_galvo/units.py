@@ -49,5 +49,14 @@ class Field:
         return bx, by
 
     def speed(self, mm_per_s: float) -> int:
-        """mm/s to the board's units per ms, capped at 0xFFFF."""
-        return min(0xFFFF, abs(int(mm_per_s * self.units_per_mm / 1000.0)))
+        """mm/s to the board's units per ms, truncated as MeerK40t does.
+
+        Raises instead of sending 0 (speeds below about 2.3 mm/s on a 150 mm
+        field) or a value the 16-bit word can't hold.
+        """
+        word = int(mm_per_s * self.units_per_mm / 1000.0)
+        if not 1 <= word <= 0xFFFF:
+            raise ValueError(
+                f"speed {mm_per_s:g} mm/s is outside what the board can express on this field"
+            )
+        return word

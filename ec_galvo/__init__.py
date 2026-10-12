@@ -4,7 +4,15 @@ Trimmed from MeerK40t's balormk driver (MIT). See UPSTREAM.md.
 """
 
 from .connection import USBConnection
-from .controller import BoardSetup, GalvoController, MarkSettings
+from .controller import (
+    AbortIncomplete,
+    BoardSetup,
+    EncodedSettings,
+    GalvoController,
+    MarkSettings,
+    StopRequested,
+    encode_settings,
+)
 from .correction import CorrectionFileError, CorrectionTable
 from .recording import RecordingConnection
 from .units import Field, OutOfFieldError
@@ -12,13 +20,17 @@ from .units import Field, OutOfFieldError
 __version__ = "0.1.0"
 
 __all__ = [
+    "AbortIncomplete",
     "BoardSetup",
     "CorrectionFileError",
     "CorrectionTable",
+    "EncodedSettings",
     "Field",
     "GalvoController",
     "MarkSettings",
     "OutOfFieldError",
     "RecordingConnection",
+    "StopRequested",
     "USBConnection",
+    "encode_settings",
 ]

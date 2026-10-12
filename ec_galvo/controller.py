@@ -12,12 +12,14 @@ Changed on purpose:
 - Moves outside the field raise instead of being skipped.
 - A missing or bad lens correction raises instead of loading a blank table.
 - The log carries state changes only. It never carries coordinates or packets.
-- Waits time out instead of spinning forever.
+- Waits time out only while the board is neither busy nor in the wanted
+  state; while BUSY they wait as long as the job runs, polling stop_check.
 - Fiber source only (CO2/UV paths removed).
 """
 
 from __future__ import annotations
 
+import math
 import struct
 import threading
 import time
@@ -60,11 +62,67 @@ class BoardSetup:
     analog_port_1: int = 0x7FF
     default_jump_speed_mm_s: float = 2000.0
     light_speed_mm_s: float = 3000.0  # red-dot framing (MeerK40t redlight_speed)
+    # Pause after a frequency or pulse-width change before marking on. JPT's M7
+    # manual gives a 4-8 ms "frequency switching time" (8 recommended); a new
+    # pulse width travels as a 4-byte serial frame (~3.2 ms at 10 kHz) and takes
+    # effect once it has arrived. Not in MeerK40t; whether LightBurn waits is
+    # unconfirmed.
+    settle_delay_ms: float = 8.0
+    # Send each mark's turn angle in MarkTo word 3 (0x8000 = 90 degrees, 0 after
+    # a jump), as EZCad does. MeerK40t always sends 0.
+    send_turn_angles: bool = True
+
+    def __post_init__(self):
+        def word(name, v):
+            if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 0xFFFF:
+                raise ValueError(f"{name} must be a whole number 0-65535")
+
+        for name in (
+            "first_pulse_killer",
+            "pwm_half_period",
+            "pwm_pulse_width",
+            "timing_mode",
+            "delay_mode",
+            "laser_mode",
+            "control_mode",
+            "analog_port_1",
+        ):
+            word(name, getattr(self, name))
+        for name, n in (("standby", 2), ("fpk2", 4), ("fly_res", 4)):
+            v = getattr(self, name)
+            if not isinstance(v, tuple) or len(v) != n:
+                raise ValueError(f"{name} must be {n} values")
+            for x in v:
+                word(name, x)
+        if not isinstance(self.send_turn_angles, bool):
+            raise ValueError("send_turn_angles must be true or false")  # noqa: TRY004 - one error type for bad setup
+        for name in ("open_mo_delay_ms", "settle_delay_ms"):
+            v = getattr(self, name)
+            # sent in 10 us units: only exact values
+            if not (math.isfinite(v) and 0 <= v <= 655.35) or abs(v * 100 - round(v * 100)) > 1e-9:
+                raise ValueError(f"{name} must be 0-655.35 ms in 0.01 ms steps")
+        for name in ("default_jump_speed_mm_s", "light_speed_mm_s"):
+            v = getattr(self, name)
+            if not (math.isfinite(v) and v > 0):
+                raise ValueError(f"{name} must be positive")
+
+
+class StopRequested(Exception):
+    """The caller's stop check returned True while the driver was waiting on the board."""
+
+
+class AbortIncomplete(RuntimeError):
+    """One or more abort steps failed; the board may not be fully stopped."""
 
 
 @dataclass(frozen=True)
 class MarkSettings:
-    """Per-layer settings, already in physical units."""
+    """Per-layer settings, already in physical units. Checked on creation.
+
+    end_delay_us (End TC; default 300 us is MeerK40t's delay_end default) is
+    not sent by set_settings: the caller sends list_delay_time(end_delay_us // 10)
+    after each object, as EZCad does (burner's mark_plan does this per path).
+    """
 
     power_pct: float
     speed_mm_s: float
@@ -75,6 +133,88 @@ class MarkSettings:
     polygon_delay_us: float
     jump_speed_mm_s: float
     end_delay_us: float = 300.0
+
+    def __post_init__(self):
+        for name in self.__dataclass_fields__:
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"{name} must be a finite number")
+        power_word(self.power_pct)
+        qswitch_period(self.frequency_khz)
+        if self.speed_mm_s <= 0 or self.jump_speed_mm_s <= 0:
+            raise ValueError("speeds must be positive")
+        if (
+            self.pulse_width_ns != int(self.pulse_width_ns)
+            or not 1 <= self.pulse_width_ns <= 0xFFFF
+        ):
+            raise ValueError("pulse_width_ns must be a whole number from 1 to 65535")
+        for name in ("laser_on_delay_us", "laser_off_delay_us"):
+            v = getattr(self, name)
+            if v != int(v) or abs(v) > 0x7FFF:
+                raise ValueError(f"{name} must be a whole number of us within +-32767")
+        # Sent in 10 us units; how LightBurn rounds is unknown, so only exact values.
+        for name, top in (("polygon_delay_us", 655350), ("end_delay_us", 655350)):
+            v = getattr(self, name)
+            if not 0 <= v <= top or v % 10:
+                raise ValueError(f"{name} must be a multiple of 10 us from 0 to {top}")
+
+
+TURN_WORD_MAX = 0x8000  # 90 degrees: the sharpest turn seen in any EZCad capture
+
+
+def _turn_degrees(prev: tuple[int, int], new: tuple[int, int]) -> float:
+    a = math.hypot(*prev) * math.hypot(*new)
+    if a == 0:
+        return 0.0
+    cos = max(-1.0, min(1.0, (prev[0] * new[0] + prev[1] * new[1]) / a))
+    return math.degrees(math.acos(cos))
+
+
+def turn_angle_word(prev: tuple[int, int], new: tuple[int, int]) -> int:
+    """Turn between two mark directions as EZCad sends it: degrees * 65536 / 180.
+
+    Capped at 0x8000 (90 degrees). No capture shows a sharper turn, and at this
+    scale 180 degrees would not fit in 16 bits, so how EZCad encodes 90-180
+    degrees (acute corners, reversals) is unknown; sending more than was ever
+    observed risks the board reading it some other way.
+    """
+    return min(TURN_WORD_MAX, round(_turn_degrees(prev, new) * 65536 / 180))
+
+
+def power_word(power_pct: float) -> int:
+    """Power in percent -> the listMarkCurrent value (12-bit)."""
+    if not 0 <= power_pct <= 100:
+        raise ValueError("power must be 0-100 %")
+    return round(power_pct * 0xFFF / 100.0)
+
+
+def qswitch_period(frequency_khz: float) -> int:
+    """Frequency in kHz -> the listQSwitchPeriod value (MeerK40t: 20000 / kHz)."""
+    if not frequency_khz > 0:
+        raise ValueError("frequency must be positive")
+    period = round(20000.0 / frequency_khz)
+    if not 1 <= period <= 0xFFFF:
+        raise ValueError("frequency out of range for the board")
+    return period
+
+
+@dataclass(frozen=True)
+class EncodedSettings:
+    """What the board receives for one MarkSettings (for matching in simulations)."""
+
+    mark_speed: int
+    power: int
+    qswitch_period: int
+    pulse_width: int
+
+
+def encode_settings(field: Field, s: MarkSettings) -> EncodedSettings:
+    return EncodedSettings(
+        mark_speed=field.speed(s.speed_mm_s),
+        power=power_word(s.power_pct),
+        qswitch_period=qswitch_period(s.frequency_khz),
+        pulse_width=int(s.pulse_width_ns),
+    )
 
 
 class GalvoController:
@@ -100,8 +240,14 @@ class GalvoController:
         self.paused = False
         self.serial_number: bytes | None = None
 
-        self._last_x = 0x8000
-        self._last_y = 0x8000
+        # Where the galvos are. None = unknown (after connecting or an abort), in
+        # which case the next move must be a jump.
+        self._last_x: int | None = None
+        self._last_y: int | None = None
+        # Polled while waiting on the board; returning True raises StopRequested.
+        self.stop_check: Callable[[], bool] | None = None
+        self._aborting = False  # during abort, waits never extend for a busy board
+        self.capped_turns = 0  # corners sharper than 90 degrees sent as 90 (see turn_angle_word)
         self._port_bits = 0
         self._list_lock = threading.RLock()
         self._send_lock = threading.RLock()
@@ -122,16 +268,28 @@ class GalvoController:
         self._delay_on = None
         self._delay_off = None
         self._delay_poly = None
+        self._prev_dir = None  # direction of the last mark in the current run
 
     #######################
     # CONNECTION
     #######################
 
     def connect(self) -> None:
+        # A fresh connection knows nothing about where the galvos are or what the
+        # board holds, even if this controller was connected before.
+        self._last_x = self._last_y = None
+        self._prev_dir = None
+        self.capped_turns = 0
+        self.mode = STATE_RAPID
+        self.paused = False
+        self._active_list = None
+        self._active_index = 0
+        self._list_executing = False
+        self._number_of_list_packets = 0
         self.connection.open()
         try:
             self._init_board()
-        except Exception:
+        except BaseException:
             self.connection.close()
             raise
 
@@ -201,18 +359,32 @@ class GalvoController:
     def is_ready(self) -> bool:
         return bool(self.status() & p.READY)
 
-    def _wait(self, done: Callable[[], bool], what: str):
+    def _wait(self, flag: int, want: bool, what: str):
+        """Wait until the status flag reaches `want`.
+
+        While the board reports BUSY it is executing a list, which can take as
+        long as the job needs, so the timeout only runs while it is neither
+        busy nor in the wanted state (a stuck board). stop_check is polled
+        throughout.
+        """
         deadline = time.monotonic() + self.wait_timeout_s
-        while not done():
-            if time.monotonic() > deadline:
+        while True:
+            status = self.status()
+            if bool(status & flag) == want:
+                return
+            if self.stop_check is not None and self.stop_check():
+                raise StopRequested
+            if status & p.BUSY and not self._aborting:
+                deadline = time.monotonic() + self.wait_timeout_s
+            elif time.monotonic() > deadline:
                 raise TimeoutError(f"board did not become {what}")
             time.sleep(0.01)
 
     def wait_ready(self):
-        self._wait(self.is_ready, "ready")
+        self._wait(p.READY, True, "ready")
 
     def wait_idle(self):
-        self._wait(lambda: not self.is_busy(), "idle")
+        self._wait(p.BUSY, False, "idle")
 
     #######################
     # MODES
@@ -222,6 +394,7 @@ class GalvoController:
         """Start a marking list."""
         if self.mode == STATE_PROGRAM:
             return
+        self.capped_turns = 0  # counted per job
         if self.mode == STATE_LIGHT:
             self.mode = STATE_PROGRAM
             self._light(False)
@@ -238,7 +411,7 @@ class GalvoController:
         self._forget_settings()
         self.list_ready()
         if self.setup.open_mo_delay_ms:
-            self.list_delay_time(int(self.setup.open_mo_delay_ms * 100))
+            self.list_delay_time(round(self.setup.open_mo_delay_ms * 100))
         self.list_write_port()
         self.list_jump_speed(self.setup.default_jump_speed_mm_s)
 
@@ -281,22 +454,58 @@ class GalvoController:
         self.mode = STATE_RAPID
 
     def abort(self):
-        self.stop_execute()
+        """Stop the board. Every step is tried even if an earlier one fails;
+        AbortIncomplete lists the steps that failed."""
         self.paused = False
-        self.set_fiber_mo(0)
-        self.reset_list()
-        self._list_new()
-        self.list_end_of_list()
-        self._list_end()
-        if not self._list_executing:
-            self.execute_list()
+        self.stop_check = None
+        failed: list[str] = []
+        interrupted: BaseException | None = None
+
+        def attempt(name, fn):
+            nonlocal interrupted
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - every remaining step must still run
+                failed.append(name)
+            except BaseException as e:  # noqa: BLE001 - Ctrl-C mid-abort: finish, then re-raise
+                failed.append(name)
+                interrupted = interrupted or e
+
+        def flush_dummy_list():
+            self._list_new()
+            self.list_end_of_list()
+            self._list_end()
+            if not self._list_executing:
+                self.execute_list()
+
+        def ports_off():
+            self._port(MAIN_BIT, False)
+            self._light(False)
+            self.write_port()
+
+        self._aborting = True
+        try:
+            attempt("stop execute", self.stop_execute)
+            attempt("close MO", lambda: self.set_fiber_mo(0))
+            attempt("reset list", self.reset_list)
+            attempt("flush list", flush_dummy_list)
+            attempt("close MO again", lambda: self.set_fiber_mo(0))
+            attempt("ports off", ports_off)
+        finally:
+            self._aborting = False
+        self._active_list = None
+        self._active_index = 0
         self._list_executing = False
         self._number_of_list_packets = 0
-        self.set_fiber_mo(0)
-        self._port(MAIN_BIT, False)
-        self._light(False)
-        self.write_port()
+        self._last_x = self._last_y = None  # where the galvos stopped is unknown
+        self._prev_dir = None
         self.mode = STATE_RAPID
+        if failed:
+            self._log(f"abort incomplete: {', '.join(failed)}")
+            incomplete = AbortIncomplete(", ".join(failed))
+            if interrupted is not None:
+                raise interrupted from incomplete
+            raise incomplete
         self._log("aborted")
 
     def pause(self):
@@ -314,38 +523,44 @@ class GalvoController:
     #######################
 
     def set_settings(self, s: MarkSettings):
-        """Queue one layer's settings. Unchanged values are not resent."""
-        self.list_fiber_ylpm_pulse_width(int(s.pulse_width_ns))
+        """Queue one layer's settings. Unchanged values are not resent.
+
+        After a frequency or pulse-width change the list waits settle_delay_ms
+        before anything else happens.
+        """
+        changed = self.list_fiber_ylpm_pulse_width(int(s.pulse_width_ns))
         self.list_jump_speed(s.jump_speed_mm_s)
-        self.frequency(s.frequency_khz)
+        changed |= self.frequency(s.frequency_khz)
         self.power(s.power_pct)
         self.list_mark_speed(s.speed_mm_s)
         self.list_laser_on_delay(s.laser_on_delay_us)
         self.list_laser_off_delay(s.laser_off_delay_us)
         self.list_polygon_delay(s.polygon_delay_us)
+        if changed and self.setup.settle_delay_ms:
+            self.list_delay_time(round(self.setup.settle_delay_ms * 100))
 
-    def power(self, power_pct: float):
-        if not 0 <= power_pct <= 100:
-            raise ValueError("power must be 0-100 %")
+    def power(self, power_pct: float) -> bool:
+        word = power_word(power_pct)
         if self._power == power_pct:
-            return
+            return False
         self._power = power_pct
-        self.list_mark_current(round(power_pct * 0xFFF / 100.0))
+        self.list_mark_current(word)
+        return True
 
-    def frequency(self, frequency_khz: float):
-        if frequency_khz <= 0:
-            raise ValueError("frequency must be positive")
+    def frequency(self, frequency_khz: float) -> bool:
+        period = qswitch_period(frequency_khz)
         if self._frequency == frequency_khz:
-            return
+            return False
         self._frequency = frequency_khz
-        self.list_qswitch_period(round(20000.0 / frequency_khz) & 0xFFFF)
+        self.list_qswitch_period(period)
+        return True
 
     #######################
     # MOVES (mm)
     #######################
 
-    def jump_mm(self, x: float, y: float):
-        self.goto(*self.field.to_board(x, y))
+    def jump_mm(self, x: float, y: float, force: bool = False):
+        self.goto(*self.field.to_board(x, y), force=force)
 
     def mark_mm(self, x: float, y: float):
         self.mark(*self.field.to_board(x, y))
@@ -364,13 +579,17 @@ class GalvoController:
 
     def mark(self, x: int, y: int):
         self._check(x, y)
+        if self._last_x is None:
+            raise RuntimeError("mark with the galvo position unknown; jump first")
         if (x, y) == (self._last_x, self._last_y):
             return
         self.list_mark(x, y)
 
-    def goto(self, x: int, y: int):
+    def goto(self, x: int, y: int, force: bool = False):
+        """Jump. Skipped when already there, unless force (each object starts
+        with a jump, as EZCad does) or the position is unknown."""
         self._check(x, y)
-        if (x, y) == (self._last_x, self._last_y):
+        if not force and (x, y) == (self._last_x, self._last_y):
             return
         self.list_jump(x, y)
 
@@ -422,7 +641,9 @@ class GalvoController:
                 return
             self.wait_ready()
             while self.paused:
-                time.sleep(0.3)
+                if self.stop_check is not None and self.stop_check():
+                    raise StopRequested
+                time.sleep(0.05)
             self._send(bytes(self._active_list), read=False)
             self.set_end_of_list(0)
             self._number_of_list_packets += 1
@@ -449,25 +670,42 @@ class GalvoController:
     #######################
 
     def _distance(self, x, y) -> int:
+        if self._last_x is None:
+            return 0xFFFF  # unknown start
         return min(0xFFFF, int(abs(complex(x, y) - complex(self._last_x, self._last_y))))
 
     def list_jump(self, x: int, y: int):
         self._list_write(p.listJumpTo, int(x), int(y), 0, self._distance(x, y))
         self._last_x, self._last_y = int(x), int(y)
+        self._prev_dir = None
 
     def list_mark(self, x: int, y: int):
-        self._list_write(p.listMarkTo, int(x), int(y), 0, self._distance(x, y))
-        self._last_x, self._last_y = int(x), int(y)
+        if self._last_x is None:
+            raise RuntimeError("mark with the galvo position unknown; jump first")
+        x, y = int(x), int(y)
+        d = (x - self._last_x, y - self._last_y)
+        angle = 0
+        if self.setup.send_turn_angles and self._prev_dir is not None:
+            angle = turn_angle_word(self._prev_dir, d)
+            if angle == TURN_WORD_MAX and _turn_degrees(self._prev_dir, d) > 90.0 + 1e-9:
+                self.capped_turns += 1
+        self._list_write(p.listMarkTo, x, y, angle, self._distance(x, y))
+        self._last_x, self._last_y = x, y
+        self._prev_dir = d
 
     def list_end_of_list(self):
         self._list_write(p.listEndOfList)
 
     def list_laser_on_point(self, dwell_10us: int):
         self._list_write(p.listLaserOnPoint, dwell_10us)
+        self._prev_dir = None
 
     def list_delay_time(self, delay_10us: int):
-        """Delay in 10 microsecond units."""
-        self._list_write(p.listDelayTime, abs(delay_10us))
+        """Delay in 10 microsecond units. Ends the current mark run."""
+        if delay_10us != int(delay_10us) or not 0 <= delay_10us <= 0xFFFF:
+            raise ValueError("list delay must be 0-65535 in 10 us units")
+        self._list_write(p.listDelayTime, int(delay_10us))
+        self._prev_dir = None
 
     def list_jump_speed(self, mm_per_s: float):
         if self._travel_speed == mm_per_s:
@@ -483,6 +721,8 @@ class GalvoController:
 
     @staticmethod
     def _signed(delay):
+        if delay != int(delay) or abs(delay) > 0x7FFF:
+            raise ValueError("delay must be a whole number of us within +-32767")
         return int(abs(delay)), 0x0000 if delay >= 0 else 0x8000
 
     def list_laser_on_delay(self, delay_us: float):
@@ -502,7 +742,9 @@ class GalvoController:
 
     def list_polygon_delay(self, delay_us: float):
         """Polygon delay is sent in 10 microsecond units."""
-        value = int(min(65535, max(0, delay_us / 10.0)))
+        if not 0 <= delay_us <= 655350 or delay_us % 10:
+            raise ValueError("polygon delay must be a multiple of 10 us from 0 to 655350")
+        value = int(delay_us // 10)
         if self._delay_poly == value:
             return
         self._delay_poly = value
@@ -517,12 +759,13 @@ class GalvoController:
     def list_qswitch_period(self, period: int):
         self._list_write(p.listQSwitchPeriod, period)
 
-    def list_fiber_ylpm_pulse_width(self, pulse_width_ns: int):
-        """MOPA pulse width in ns (sent as-is, as MeerK40t does)."""
+    def list_fiber_ylpm_pulse_width(self, pulse_width_ns: int) -> bool:
+        """MOPA pulse width in ns (sent as-is, as MeerK40t does; JPT takes ns)."""
         if self._pulse_width == pulse_width_ns:
-            return
+            return False
         self._pulse_width = pulse_width_ns
         self._list_write(p.listFiberYLPMPulseWidth, pulse_width_ns)
+        return True
 
     def list_ready(self):
         self._list_write(p.listReadyMark)
@@ -561,6 +804,7 @@ class GalvoController:
         self._check(x, y)
         distance = self._distance(x, y)
         self._last_x, self._last_y = x, y
+        self._prev_dir = None
         return self._command(p.GotoXY, x, y, 0, distance)
 
     def reset_list(self):
