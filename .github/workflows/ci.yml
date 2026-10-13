@@ -1,0 +1,50 @@
+# Lint, format check and tests on every supported Python.
+#
+# ruff is pinned to the version in the private burner repo's Nix shell, so both repos
+# agree on formatting. Tests use a recording connection; no laser or USB device needed.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch (or pull request) cancels the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, format and tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Finish both versions even if one fails, to see whether a failure is version-specific.
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ec-galvo, pytest, hypothesis and ruff
+        run: python -m pip install ".[test]" "ruff==0.11.13"
+
+      - name: Lint
+        run: ruff check ec_galvo tests
+
+      - name: Format check
+        run: ruff format --check ec_galvo tests
+
+      - name: Tests
+        run: pytest
