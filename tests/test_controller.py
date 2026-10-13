@@ -13,6 +13,7 @@ from ec_galvo import (
     RecordingConnection,
 )
 from ec_galvo import protocol as p
+from ec_galvo.controller import qswitch_period
 
 LAYER = MarkSettings(
     power_pct=40,
@@ -562,3 +563,28 @@ def test_capped_turns_count_per_job():
         c.mark_mm(10, 11)
         c.rapid_mode()
         assert c.capped_turns == 1
+
+
+@pytest.mark.parametrize("size", [0.0, -1.0, float("inf"), float("nan"), 5e-324])
+def test_field_size_must_be_a_usable_number(size):
+    with pytest.raises(ValueError):
+        Field(size)
+
+
+@pytest.mark.parametrize("offset", [(float("inf"), 0.0), (0.0, float("nan")), (0.0,)])
+def test_field_offset_must_be_two_finite_numbers(offset):
+    with pytest.raises(ValueError):
+        Field(150.0, offset_mm=offset)
+
+
+def test_huge_numbers_raise_plain_errors_not_overflow():
+    field = Field(150.0)
+    with pytest.raises(OutOfFieldError):
+        field.to_board(1e308, 0.0)
+    with pytest.raises(ValueError, match="outside what the board can express"):
+        field.speed(1e308)
+    with pytest.raises(ValueError):
+        field.speed(float("nan"))
+    for khz in (5e-324, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            qswitch_period(khz)

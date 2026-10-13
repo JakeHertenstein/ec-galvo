@@ -7,6 +7,7 @@ flip/swap options match how the galvos are wired.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 GALVO_RANGE = 0xFFFF
@@ -25,8 +26,12 @@ class Field:
     offset_mm: tuple[float, float] = (0.0, 0.0)  # jig offset, added before mapping
 
     def __post_init__(self):
-        if self.size_mm <= 0:
-            raise ValueError("field size must be positive")
+        if not (math.isfinite(self.size_mm) and self.size_mm > 0):
+            raise ValueError("field size must be a positive number")
+        if not math.isfinite(GALVO_RANGE / self.size_mm):
+            raise ValueError("field size is too small")
+        if len(self.offset_mm) != 2 or not all(math.isfinite(v) for v in self.offset_mm):
+            raise ValueError("field offset must be two finite numbers")
 
     @property
     def units_per_mm(self) -> float:
@@ -42,8 +47,10 @@ class Field:
             x = self.size_mm - x
         if self.flip_y:
             y = self.size_mm - y
-        bx = round(x * self.units_per_mm)
-        by = round(y * self.units_per_mm)
+        fx, fy = x * self.units_per_mm, y * self.units_per_mm
+        if not (math.isfinite(fx) and math.isfinite(fy)):
+            raise OutOfFieldError("point is outside the lens field")
+        bx, by = round(fx), round(fy)
         if not (0 <= bx <= GALVO_RANGE and 0 <= by <= GALVO_RANGE):
             raise OutOfFieldError("point is outside the lens field")
         return bx, by
@@ -54,7 +61,8 @@ class Field:
         Raises instead of sending 0 (speeds below about 2.3 mm/s on a 150 mm
         field) or a value the 16-bit word can't hold.
         """
-        word = int(mm_per_s * self.units_per_mm / 1000.0)
+        units = mm_per_s * self.units_per_mm / 1000.0
+        word = int(units) if math.isfinite(units) else 0
         if not 1 <= word <= 0xFFFF:
             raise ValueError(
                 f"speed {mm_per_s:g} mm/s is outside what the board can express on this field"

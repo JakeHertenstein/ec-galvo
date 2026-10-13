@@ -75,6 +75,13 @@ Board start-up values (`BoardSetup`) are MeerK40t's device defaults.
   clamping to 0xFFFF. `BoardSetup` checks its delays (exact 0.01 ms steps) and
   speeds on creation; `list_polygon_delay` raises instead of clamping.
 - A list delay ends a mark run, so the next mark carries no turn angle.
+- `.cor` files: only the `LMC1COR_1.0` (float) layout loads by default. MeerK40t reads
+  any other file of the right size as the older integer layout, which has no label of
+  its own, so an all-zero or unrelated file would pass for a lens table. Pass
+  `allow_int_layout=True` once a real integer-layout file has been seen.
+- Non-finite or overflowing numbers (field size, offsets, speeds, frequencies,
+  correction offsets) raise `ValueError` / `OutOfFieldError` / `CorrectionFileError`
+  instead of `OverflowError`.
 
 ## Not carried over
 

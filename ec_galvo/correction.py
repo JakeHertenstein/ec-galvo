@@ -10,6 +10,7 @@ Format logic from MeerK40t meerk40t/balormk/controller.py (MIT).
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
@@ -31,6 +32,8 @@ class CorrectionFileError(ValueError):
 
 def _encode(v: float) -> int:
     """Board wants sign-magnitude: bit 15 is the sign, low 15 bits the size."""
+    if not math.isfinite(v):
+        raise CorrectionFileError("correction offset is not a number")
     n = round(v)
     if abs(n) > 0x7FFF:
         raise CorrectionFileError(f"correction offset {n} out of range")
@@ -55,7 +58,12 @@ class CorrectionTable:
         return cls(entries=(), blank=True)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> CorrectionTable:
+    def from_bytes(cls, data: bytes, allow_int_layout: bool = False) -> CorrectionTable:
+        """Parse a .cor file. Only the LMC1COR_1.0 (float) layout is accepted
+        unless allow_int_layout: the older integer layout has no label of its
+        own, so any file of the right size would pass for one (MeerK40t reads it
+        as the fallback). Ask for it explicitly once a real file of that kind
+        has been seen."""
         if len(data) < _LABEL_LEN:
             raise CorrectionFileError("file too short to be a .cor file")
         try:
@@ -72,6 +80,11 @@ class CorrectionTable:
             scale = struct.unpack_from("<63d", header, 2)[43]
             values = struct.unpack_from(f"<{POINTS * 2}d", data, _LABEL_LEN + _FLOAT_HEADER_LEN)
         else:
+            if not allow_int_layout:
+                raise CorrectionFileError(
+                    f"not an {_FLOAT_LABEL} .cor file (label {label!r}, {len(data)} bytes); "
+                    "older integer-layout files load only with allow_int_layout=True"
+                )
             if len(data) != INT_FILE_LEN:
                 raise CorrectionFileError(
                     f"unrecognised .cor file: label {label!r}, {len(data)} bytes "

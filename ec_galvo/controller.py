@@ -190,9 +190,12 @@ def power_word(power_pct: float) -> int:
 
 def qswitch_period(frequency_khz: float) -> int:
     """Frequency in kHz -> the listQSwitchPeriod value (MeerK40t: 20000 / kHz)."""
-    if not frequency_khz > 0:
-        raise ValueError("frequency must be positive")
-    period = round(20000.0 / frequency_khz)
+    if not (math.isfinite(frequency_khz) and frequency_khz > 0):
+        raise ValueError("frequency must be a positive number")
+    exact = 20000.0 / frequency_khz
+    if not math.isfinite(exact):
+        raise ValueError("frequency out of range for the board")
+    period = round(exact)
     if not 1 <= period <= 0xFFFF:
         raise ValueError("frequency out of range for the board")
     return period
