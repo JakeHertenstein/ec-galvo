@@ -462,7 +462,10 @@ class GalvoController:
         self._forget_settings()
 
     def program_mode(self):
-        """Start a marking list. From framing, call rapid_mode() first."""
+        """Start a marking list. From framing, call rapid_mode() first.
+
+        If this raises, the mode goes back to rapid so a retry starts from
+        scratch; the MO may already be open, so call abort() before retrying."""
         if self.mode == STATE_PROGRAM:
             return
         if self.mode == STATE_LIGHT:
@@ -473,19 +476,26 @@ class GalvoController:
         jump = self.field.speed(self.setup.default_jump_speed_mm_s)  # before anything is sent
         self.capped_turns = 0  # counted per job
         self._start_list(STATE_PROGRAM)
-        self.reset_list()
-        self._port(MAIN_BIT, True)
-        self._light(False)
-        self.write_port()
-        self.set_fiber_mo(1)
-        self.list_ready()
-        if self.setup.open_mo_delay_ms:
-            self.list_delay_time(round(self.setup.open_mo_delay_ms * 100))
-        self.list_write_port()
-        self._list_setting(p.listJumpSpeed, jump)
+        try:
+            self.reset_list()
+            self._port(MAIN_BIT, True)
+            self._light(False)
+            self.write_port()
+            self.set_fiber_mo(1)
+            self.list_ready()
+            if self.setup.open_mo_delay_ms:
+                self.list_delay_time(round(self.setup.open_mo_delay_ms * 100))
+            self.list_write_port()
+            self._list_setting(p.listJumpSpeed, jump)
+        except BaseException:
+            self._start_list(STATE_RAPID)  # half-started: a retry must send everything again
+            raise
 
     def light_mode(self):
-        """Start a red-light framing list. From marking, call rapid_mode() first."""
+        """Start a red-light framing list. From marking, call rapid_mode() first.
+
+        If this raises, the mode goes back to rapid so a retry starts from
+        scratch; call abort() before retrying."""
         if self.mode == STATE_LIGHT:
             return
         if self.mode == STATE_PROGRAM:
@@ -494,14 +504,18 @@ class GalvoController:
             raise RuntimeError(_SWITCH)
         jump = self.field.speed(self.setup.light_speed_mm_s)  # before anything is sent
         self._start_list(STATE_LIGHT)
-        self.reset_list()
-        self.list_ready()
-        self._port(MAIN_BIT, False)
-        self._port(LIGHT_BIT, True)
-        self.list_write_port()
-        # Upstream leaves this to the caller; without it framing runs at whatever
-        # speed the board last had.
-        self._list_setting(p.listJumpSpeed, jump)
+        try:
+            self.reset_list()
+            self.list_ready()
+            self._port(MAIN_BIT, False)
+            self._port(LIGHT_BIT, True)
+            self.list_write_port()
+            # Upstream leaves this to the caller; without it framing runs at whatever
+            # speed the board last had.
+            self._list_setting(p.listJumpSpeed, jump)
+        except BaseException:
+            self._start_list(STATE_RAPID)  # half-started: a retry must send everything again
+            raise
 
     def rapid_mode(self):
         """Finish the current list, wait for it to run out, return to idle."""

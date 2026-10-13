@@ -1059,3 +1059,52 @@ def test_short_serial_reply_is_a_connection_error_not_a_mismatch():
         c.connect()
     assert not isinstance(e.value, ConnectionRefusedError)
     assert not conn.is_open()
+
+
+class FailOnceConnection(RecordingConnection):
+    """Fails the first single command with this opcode, then works."""
+
+    def __init__(self, fail_opcode):
+        super().__init__()
+        self.fail_opcode = fail_opcode
+
+    def write(self, packet):
+        if len(packet) == 12 and struct.unpack_from("<H", packet)[0] == self.fail_opcode:
+            self.fail_opcode = None
+            raise ConnectionError("simulated failure")
+        super().write(packet)
+
+
+@pytest.mark.parametrize("enter", ["program_mode", "light_mode"])
+def test_a_half_started_mode_switch_is_retried_from_scratch(enter):
+    conn = FailOnceConnection(p.ResetList)
+    c = GalvoController(conn, Field(size_mm=150.0), CorrectionTable.no_correction())
+    c.connect()
+    with pytest.raises(ConnectionError):
+        getattr(c, enter)()
+    assert c.mode == "rapid"
+    start = len(conn.packets)
+    getattr(c, enter)()  # sends everything again, not nothing
+    c.goto(1000, 1000)
+    c.rapid_mode()
+    assert singles(conn, start)[0] == "ResetList"
+    sent = RecordingConnection(packets=conn.packets[start:]).commands()
+    names = [cmd.name for cmd in sent if cmd.in_list]
+    assert names[0] == "listReadyMark" and "listJumpSpeed" in names
+
+
+def test_abort_after_stop_while_the_board_is_still_busy():
+    """The usual Stop: stop_check keeps returning True while abort waits on a
+    board that is briefly busy. Abort's own waits must not stop on it."""
+    c, conn = make()
+    c.program_mode()
+    c.set_settings(LAYER)
+    for i in range(500):  # four packets: the list is already executing
+        c.goto(1000, 1000 + i)
+        c.mark(2000, 1000 + i)
+    c.stop_check = lambda: True
+    conn.status_script.extend([p.BUSY, p.READY])
+    start = len(conn.packets)
+    c.abort()
+    assert not conn.status_script
+    assert singles(conn, start)[-2:] == ["Fiber_SetMo 0", "WritePort 0"]
