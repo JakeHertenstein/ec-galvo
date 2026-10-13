@@ -15,6 +15,7 @@ from .protocol import (
     PACKET_LIST,
     READY,
     GetSerialNo,
+    GetVersion,
     list_command_lookup,
     listEndOfList,
     single_command_lookup,
@@ -46,6 +47,9 @@ class RecordingConnection:
     # repr=False: packets hold coordinates, which must never reach a log or traceback
     packets: list[bytes] = field(default_factory=list, repr=False)
     replies: deque[bytes] = field(default_factory=deque, repr=False)  # override defaults
+    # Status words for successive GetVersion polls (how the driver reads the
+    # board's state, e.g. BUSY while a list runs); once used up, status_word.
+    status_script: deque[int] = field(default_factory=deque, repr=False)
     _open: bool = False
     _last_opcode: int | None = None
 
@@ -74,7 +78,10 @@ class RecordingConnection:
             return self.replies.popleft()
         if self._last_opcode == GetSerialNo:
             return self.serial[:8].ljust(8, b"\0")
-        return struct.pack("<4H", 0, 0, 0, self.status_word)
+        status = self.status_word
+        if self._last_opcode == GetVersion and self.status_script:
+            status = self.status_script.popleft()
+        return struct.pack("<4H", 0, 0, 0, status)
 
     def commands(self) -> list[Command]:
         """Every command sent, in order. Trailing list padding is dropped."""

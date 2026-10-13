@@ -1,6 +1,6 @@
 [project]
 name = "ec-galvo"
-version = "0.1.0"
+dynamic = ["version"]  # from ec_galvo.__version__, the one place it is kept
 description = "Small driver for JCZ LMC (EZCAD2-era) galvo laser boards, trimmed from MeerK40t"
 license = "MIT"
 requires-python = ">=3.12"
@@ -10,14 +10,20 @@ dependencies = ["pyusb"]
 test = ["pytest", "hypothesis"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # 77+ for the plain-string license
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["ec_galvo"]
 
+[tool.setuptools.dynamic]
+version = {attr = "ec_galvo.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the working copy, not an installed ec-galvo (burner's dev shell has one
+# installed and sets PYTHONSAFEPATH, so the repo folder is not on the path).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

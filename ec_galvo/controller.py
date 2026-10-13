@@ -14,7 +14,15 @@ Changed on purpose:
 - The log carries state changes only. It never carries coordinates or packets.
 - Waits time out only while the board is neither busy nor in the wanted
   state; while BUSY they wait as long as the job runs, polling stop_check.
+- Calls that don't fit the current mode raise: list commands need an open list
+  (program_mode or light_mode), marks need a marking list, goto_xy needs no list,
+  and switching between framing and marking needs rapid_mode in between.
+- Board values must be whole numbers 0-65535; a short board reply raises
+  ConnectionError.
 - Fiber source only (CO2/UV paths removed).
+
+Drive a controller from one thread. To stop a job from elsewhere, make
+stop_check return True; the job thread then gets StopRequested and calls abort().
 """
 
 from __future__ import annotations
@@ -40,6 +48,54 @@ _EMPTY_LIST = _NOP * (p.PACKET_LIST // 12)
 
 LIGHT_BIT = 8  # red-dot pointer output pin
 MAIN_BIT = 0
+
+_NO_LIST = "no list open: call program_mode() or light_mode() first"
+_NOT_MARKING = "marks need a marking list: call program_mode() first"
+_SWITCH = "call rapid_mode() before switching between framing and marking"
+
+# List commands that set a value the board keeps for the rest of the list. The
+# last value queued for each is remembered so unchanged settings aren't resent.
+_SETTINGS = frozenset(
+    {
+        p.listJumpSpeed,
+        p.listMarkSpeed,
+        p.listLaserOnDelay,
+        p.listLaserOffDelay,
+        p.listPolygonDelay,
+        p.listMarkCurrent,
+        p.listQSwitchPeriod,
+        p.listFiberYLPMPulseWidth,
+    }
+)
+
+
+def _is_whole(v) -> bool:
+    """True for a whole number (1000 or 1000.0); False for 1000.5, inf, nan or non-numbers."""
+    try:
+        return bool(v == int(v))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _words(command: int, values, in_list: bool) -> tuple[int, ...]:
+    """The values as board words. The error names the command, never the value
+    (it may be a coordinate)."""
+    out = []
+    for v in values:
+        if not (_is_whole(v) and 0 <= v <= 0xFFFF):
+            names = p.list_command_lookup if in_list else p.single_command_lookup
+            name = names.get(command, f"command 0x{command:04x}")
+            raise ValueError(f"{name}: board values must be whole numbers from 0 to 65535")
+        out.append(int(v))
+    return tuple(out)
+
+
+def _reply(r) -> bytes:
+    """A single command's 8-byte answer. Gives only the length if it is wrong."""
+    n = 0 if r is None else len(r)
+    if n != 8:
+        raise ConnectionError(f"board reply was {n} bytes, expected 8")
+    return bytes(r)
 
 
 @dataclass(frozen=True)
@@ -259,18 +315,20 @@ class GalvoController:
         self._list_executing = False
         self._number_of_list_packets = 0
         self._forget_settings()
+        # Fail here, before anything is sent, if the board can't express these
+        # speeds on this field (program_mode and light_mode check again, in case
+        # the field is swapped later).
+        for name in ("default_jump_speed_mm_s", "light_speed_mm_s"):
+            try:
+                self.field.speed(getattr(self.setup, name))
+            except ValueError as e:
+                raise ValueError(f"BoardSetup.{name}: {e}") from None
 
     def _forget_settings(self):
-        # Cached values let us skip resending unchanged settings. Every new list
-        # starts with none cached, so the first layer always sends everything.
-        self._speed = None
-        self._travel_speed = None
-        self._frequency = None
-        self._power = None
-        self._pulse_width = None
-        self._delay_on = None
-        self._delay_off = None
-        self._delay_poly = None
+        # The board values queued in the current list, by command, so unchanged
+        # settings aren't resent. Every new list starts with none, so the first
+        # layer always sends everything.
+        self._sent: dict[int, tuple[int, ...]] = {}
         self._prev_dir = None  # direction of the last mark in the current run
 
     #######################
@@ -281,10 +339,11 @@ class GalvoController:
         # A fresh connection knows nothing about where the galvos are or what the
         # board holds, even if this controller was connected before.
         self._last_x = self._last_y = None
-        self._prev_dir = None
+        self._forget_settings()
         self.capped_turns = 0
         self.mode = STATE_RAPID
         self.paused = False
+        self._port_bits = 0  # the board is Reset below: every output is off
         self._active_list = None
         self._active_index = 0
         self._list_executing = False
@@ -309,9 +368,9 @@ class GalvoController:
         return None
 
     def _command(self, command, v1=0, v2=0, v3=0, v4=0, v5=0, read=True):
-        cmd = struct.pack("<6H", int(command), int(v1), int(v2), int(v3), int(v4), int(v5))
-        r = self._send(cmd, read=read)
-        return struct.unpack("<4H", r) if read else None
+        words = _words(command, (v1, v2, v3, v4, v5), in_list=False)
+        r = self._send(struct.pack("<6H", command, *words), read=read)
+        return struct.unpack("<4H", _reply(r)) if read else None
 
     def _init_board(self):
         s = self.setup
@@ -368,14 +427,14 @@ class GalvoController:
         While the board reports BUSY it is executing a list, which can take as
         long as the job needs, so the timeout only runs while it is neither
         busy nor in the wanted state (a stuck board). stop_check is polled
-        throughout.
+        throughout, except during an abort, which uses the hard timeout instead.
         """
         deadline = time.monotonic() + self.wait_timeout_s
         while True:
             status = self.status()
             if bool(status & flag) == want:
                 return
-            if self.stop_check is not None and self.stop_check():
+            if not self._aborting and self.stop_check is not None and self.stop_check():
                 raise StopRequested
             if status & p.BUSY and not self._aborting:
                 deadline = time.monotonic() + self.wait_timeout_s
@@ -393,51 +452,56 @@ class GalvoController:
     # MODES
     #######################
 
+    def _start_list(self, mode: str):
+        """Driver side of a fresh list: nothing queued, nothing cached."""
+        self.mode = mode
+        self._active_list = None
+        self._active_index = 0
+        self._list_executing = False
+        self._number_of_list_packets = 0
+        self._forget_settings()
+
     def program_mode(self):
-        """Start a marking list."""
+        """Start a marking list. From framing, call rapid_mode() first."""
         if self.mode == STATE_PROGRAM:
             return
-        self.capped_turns = 0  # counted per job
         if self.mode == STATE_LIGHT:
-            self.mode = STATE_PROGRAM
-            self._light(False)
-            self._port(MAIN_BIT, True)
-            self.write_port()
-            self.set_fiber_mo(1)
-            self.list_jump_speed(self.setup.default_jump_speed_mm_s)
-            return
-        self.mode = STATE_PROGRAM
+            # The framing list hasn't run yet. Marks added to it would run with its
+            # port bits (red dot on, main bit off) and without ReadyMark or the
+            # open-MO delay.
+            raise RuntimeError(_SWITCH)
+        jump = self.field.speed(self.setup.default_jump_speed_mm_s)  # before anything is sent
+        self.capped_turns = 0  # counted per job
+        self._start_list(STATE_PROGRAM)
         self.reset_list()
         self._port(MAIN_BIT, True)
+        self._light(False)
         self.write_port()
         self.set_fiber_mo(1)
-        self._forget_settings()
         self.list_ready()
         if self.setup.open_mo_delay_ms:
             self.list_delay_time(round(self.setup.open_mo_delay_ms * 100))
         self.list_write_port()
-        self.list_jump_speed(self.setup.default_jump_speed_mm_s)
+        self._list_setting(p.listJumpSpeed, jump)
 
     def light_mode(self):
-        """Start a red-light framing list."""
+        """Start a red-light framing list. From marking, call rapid_mode() first."""
         if self.mode == STATE_LIGHT:
             return
         if self.mode == STATE_PROGRAM:
-            self.set_fiber_mo(0)
-            self._port(MAIN_BIT, False)
-            self._port(LIGHT_BIT, True)
-            self.write_port()
-        else:
-            self._forget_settings()
-            self.reset_list()
-            self.list_ready()
-            self._port(MAIN_BIT, False)
-            self._port(LIGHT_BIT, True)
-            self.list_write_port()
+            # The marks queued so far haven't run yet: closing the MO now would
+            # run them with the laser off.
+            raise RuntimeError(_SWITCH)
+        jump = self.field.speed(self.setup.light_speed_mm_s)  # before anything is sent
+        self._start_list(STATE_LIGHT)
+        self.reset_list()
+        self.list_ready()
+        self._port(MAIN_BIT, False)
+        self._port(LIGHT_BIT, True)
+        self.list_write_port()
         # Upstream leaves this to the caller; without it framing runs at whatever
         # speed the board last had.
-        self.list_jump_speed(self.setup.light_speed_mm_s)
-        self.mode = STATE_LIGHT
+        self._list_setting(p.listJumpSpeed, jump)
 
     def rapid_mode(self):
         """Finish the current list, wait for it to run out, return to idle."""
@@ -458,9 +522,11 @@ class GalvoController:
 
     def abort(self):
         """Stop the board. Every step is tried even if an earlier one fails;
-        AbortIncomplete lists the steps that failed."""
+        AbortIncomplete lists the steps that failed.
+
+        stop_check is left in place but not polled while aborting; waits use
+        the hard timeout instead. Call from the thread driving the job."""
         self.paused = False
-        self.stop_check = None
         failed: list[str] = []
         interrupted: BaseException | None = None
 
@@ -495,14 +561,15 @@ class GalvoController:
             attempt("close MO again", lambda: self.set_fiber_mo(0))
             attempt("ports off", ports_off)
         finally:
+            # Also on a Ctrl-C between two steps.
             self._aborting = False
-        self._active_list = None
-        self._active_index = 0
-        self._list_executing = False
-        self._number_of_list_packets = 0
-        self._last_x = self._last_y = None  # where the galvos stopped is unknown
-        self._prev_dir = None
-        self.mode = STATE_RAPID
+            self._active_list = None
+            self._active_index = 0
+            self._list_executing = False
+            self._number_of_list_packets = 0
+            self._last_x = self._last_y = None  # where the galvos stopped is unknown
+            self._prev_dir = None
+            self.mode = STATE_RAPID
         if failed:
             self._log(f"abort incomplete: {', '.join(failed)}")
             incomplete = AbortIncomplete(", ".join(failed))
@@ -529,34 +596,33 @@ class GalvoController:
         """Queue one layer's settings. Unchanged values are not resent.
 
         After a frequency or pulse-width change the list waits settle_delay_ms
-        before anything else happens.
+        before anything else happens. Every board value is worked out before
+        anything is queued, so a layer the board can't run queues nothing.
         """
-        changed = self.list_fiber_ylpm_pulse_width(int(s.pulse_width_ns))
-        self.list_jump_speed(s.jump_speed_mm_s)
-        changed |= self.frequency(s.frequency_khz)
-        self.power(s.power_pct)
-        self.list_mark_speed(s.speed_mm_s)
-        self.list_laser_on_delay(s.laser_on_delay_us)
-        self.list_laser_off_delay(s.laser_off_delay_us)
-        self.list_polygon_delay(s.polygon_delay_us)
+        self._need_list()
+        enc = encode_settings(self.field, s)
+        jump = self.field.speed(s.jump_speed_mm_s)
+        on = self._signed(s.laser_on_delay_us)
+        off = self._signed(s.laser_off_delay_us)
+        poly = self._polygon_word(s.polygon_delay_us)
+        changed = self._list_setting(p.listFiberYLPMPulseWidth, enc.pulse_width)
+        self._list_setting(p.listJumpSpeed, jump)
+        changed |= self._list_setting(p.listQSwitchPeriod, enc.qswitch_period)
+        self._list_setting(p.listMarkCurrent, enc.power)
+        self._list_setting(p.listMarkSpeed, enc.mark_speed)
+        self._list_setting(p.listLaserOnDelay, *on)
+        self._list_setting(p.listLaserOffDelay, *off)
+        self._list_setting(p.listPolygonDelay, poly)
         if changed and self.setup.settle_delay_ms:
             self.list_delay_time(round(self.setup.settle_delay_ms * 100))
 
     def power(self, power_pct: float) -> bool:
-        word = power_word(power_pct)
-        if self._power == power_pct:
-            return False
-        self._power = power_pct
-        self.list_mark_current(word)
-        return True
+        """Queue the power unless the list already has it. True if queued."""
+        return self._list_setting(p.listMarkCurrent, power_word(power_pct))
 
     def frequency(self, frequency_khz: float) -> bool:
-        period = qswitch_period(frequency_khz)
-        if self._frequency == frequency_khz:
-            return False
-        self._frequency = frequency_khz
-        self.list_qswitch_period(period)
-        return True
+        """Queue the frequency unless the list already has it. True if queued."""
+        return self._list_setting(p.listQSwitchPeriod, qswitch_period(frequency_khz))
 
     #######################
     # MOVES (mm)
@@ -577,10 +643,15 @@ class GalvoController:
 
     @staticmethod
     def _check(x, y):
+        if not (_is_whole(x) and _is_whole(y)):
+            raise ValueError("board moves must be whole numbers")
         if not (0 <= x <= GALVO_RANGE and 0 <= y <= GALVO_RANGE):
             raise ValueError("move outside board range")
 
     def mark(self, x: int, y: int):
+        """Mark to (x, y). Only in a marking list (program_mode)."""
+        if self.mode != STATE_PROGRAM:
+            raise RuntimeError(_NOT_MARKING)
         self._check(x, y)
         if self._last_x is None:
             raise RuntimeError("mark with the galvo position unknown; jump first")
@@ -591,6 +662,7 @@ class GalvoController:
     def goto(self, x: int, y: int, force: bool = False):
         """Jump. Skipped when already there, unless force (each object starts
         with a jump, as EZCad does) or the position is unknown."""
+        self._need_list()
         self._check(x, y)
         if not force and (x, y) == (self._last_x, self._last_y):
             return
@@ -598,6 +670,7 @@ class GalvoController:
 
     def light(self, x: int, y: int):
         """Jump with the red dot on (framing)."""
+        self._need_list()
         self._check(x, y)
         if self._light(True):
             self.list_write_port()
@@ -605,6 +678,7 @@ class GalvoController:
 
     def dark(self, x: int, y: int):
         """Jump with the red dot off."""
+        self._need_list()
         self._check(x, y)
         if self._light(False):
             self.list_write_port()
@@ -643,7 +717,7 @@ class GalvoController:
             if not self._active_list or not self._active_index:
                 return
             self.wait_ready()
-            while self.paused:
+            while self.paused and not self._aborting:
                 if self.stop_check is not None and self.stop_check():
                     raise StopRequested
                 time.sleep(0.05)
@@ -656,17 +730,36 @@ class GalvoController:
                 self.execute_list()
                 self._list_executing = True
 
+    def _need_list(self):
+        """List commands go into a list opened by program_mode or light_mode
+        (abort's own flush list excepted). Outside one they would wait in the
+        driver and run at the start of the next job, before its settings."""
+        if self.mode == STATE_RAPID and not self._aborting:
+            raise RuntimeError(_NO_LIST)
+
     def _list_write(self, command, v1=0, v2=0, v3=0, v4=0, v5=0):
+        self._need_list()
+        words = _words(command, (v1, v2, v3, v4, v5), in_list=True)
         with self._list_lock:
             if self._active_index >= p.PACKET_LIST:
                 self._list_end()
             if self._active_list is None:
                 self._list_new()
             i = self._active_index
-            self._active_list[i : i + 12] = struct.pack(
-                "<6H", int(command), int(v1), int(v2), int(v3), int(v4), int(v5)
-            )
+            self._active_list[i : i + 12] = struct.pack("<6H", command, *words)
             self._active_index += 12
+            if command in _SETTINGS:
+                self._sent[command] = words
+
+    def _list_setting(self, command: int, *values) -> bool:
+        """Queue a setting unless the list already holds this board value.
+        Remembered only once queued. True if queued."""
+        self._need_list()
+        words = _words(command, (*values, 0, 0, 0, 0, 0)[:5], in_list=True)
+        if self._sent.get(command) == words:
+            return False
+        self._list_write(command, *words)
+        return True
 
     #######################
     # LIST COMMANDS
@@ -678,21 +771,28 @@ class GalvoController:
         return min(0xFFFF, int(abs(complex(x, y) - complex(self._last_x, self._last_y))))
 
     def list_jump(self, x: int, y: int):
-        self._list_write(p.listJumpTo, int(x), int(y), 0, self._distance(x, y))
-        self._last_x, self._last_y = int(x), int(y)
+        self._check(x, y)
+        x, y = int(x), int(y)
+        self._list_write(p.listJumpTo, x, y, 0, self._distance(x, y))
+        self._last_x, self._last_y = x, y
         self._prev_dir = None
 
     def list_mark(self, x: int, y: int):
+        if self.mode != STATE_PROGRAM:
+            raise RuntimeError(_NOT_MARKING)
+        self._check(x, y)
         if self._last_x is None:
             raise RuntimeError("mark with the galvo position unknown; jump first")
         x, y = int(x), int(y)
         d = (x - self._last_x, y - self._last_y)
         angle = 0
+        capped = False
         if self.setup.send_turn_angles and self._prev_dir is not None:
             angle = turn_angle_word(self._prev_dir, d)
-            if angle == TURN_WORD_MAX and _turn_degrees(self._prev_dir, d) > 90.0 + 1e-9:
-                self.capped_turns += 1
+            capped = angle == TURN_WORD_MAX and _turn_degrees(self._prev_dir, d) > 90.0 + 1e-9
         self._list_write(p.listMarkTo, x, y, angle, self._distance(x, y))
+        if capped:
+            self.capped_turns += 1
         self._last_x, self._last_y = x, y
         self._prev_dir = d
 
@@ -705,70 +805,66 @@ class GalvoController:
 
     def list_delay_time(self, delay_10us: int):
         """Delay in 10 microsecond units. Ends the current mark run."""
-        if delay_10us != int(delay_10us) or not 0 <= delay_10us <= 0xFFFF:
+        if not (_is_whole(delay_10us) and 0 <= delay_10us <= 0xFFFF):
             raise ValueError("list delay must be 0-65535 in 10 us units")
         self._list_write(p.listDelayTime, int(delay_10us))
         self._prev_dir = None
 
+    # The setters below skip a value the list already holds (compared as the
+    # board receives it) and remember a value only once it is queued.
+
     def list_jump_speed(self, mm_per_s: float):
-        if self._travel_speed == mm_per_s:
-            return
-        self._travel_speed = mm_per_s
-        self._list_write(p.listJumpSpeed, self.field.speed(mm_per_s))
+        self._list_setting(p.listJumpSpeed, self.field.speed(mm_per_s))
 
     def list_mark_speed(self, mm_per_s: float):
-        if self._speed == mm_per_s:
-            return
-        self._speed = mm_per_s
-        self._list_write(p.listMarkSpeed, self.field.speed(mm_per_s))
+        self._list_setting(p.listMarkSpeed, self.field.speed(mm_per_s))
 
     @staticmethod
     def _signed(delay):
-        if delay != int(delay) or abs(delay) > 0x7FFF:
+        if not _is_whole(delay) or abs(delay) > 0x7FFF:
             raise ValueError("delay must be a whole number of us within +-32767")
         return int(abs(delay)), 0x0000 if delay >= 0 else 0x8000
 
+    @staticmethod
+    def _polygon_word(delay_us) -> int:
+        """Polygon delay in us -> the board's 10 us units."""
+        try:
+            ok = 0 <= delay_us <= 655350 and not delay_us % 10
+        except TypeError:
+            ok = False
+        if not ok:
+            raise ValueError("polygon delay must be a multiple of 10 us from 0 to 655350")
+        return int(delay_us // 10)
+
     def list_laser_on_delay(self, delay_us: float):
-        if self._delay_on == delay_us:
-            return
-        self._delay_on = delay_us
-        self._list_write(p.listLaserOnDelay, *self._signed(delay_us))
+        self._list_setting(p.listLaserOnDelay, *self._signed(delay_us))
 
     def list_laser_off_delay(self, delay_us: float):
-        if self._delay_off == delay_us:
-            return
-        self._delay_off = delay_us
-        self._list_write(p.listLaserOffDelay, *self._signed(delay_us))
+        self._list_setting(p.listLaserOffDelay, *self._signed(delay_us))
 
     def list_jump_delay(self, delay_us: float):
         self._list_write(p.listJumpDelay, *self._signed(delay_us))
 
     def list_polygon_delay(self, delay_us: float):
         """Polygon delay is sent in 10 microsecond units."""
-        if not 0 <= delay_us <= 655350 or delay_us % 10:
-            raise ValueError("polygon delay must be a multiple of 10 us from 0 to 655350")
-        value = int(delay_us // 10)
-        if self._delay_poly == value:
-            return
-        self._delay_poly = value
-        self._list_write(p.listPolygonDelay, value)
+        self._list_setting(p.listPolygonDelay, self._polygon_word(delay_us))
 
     def list_write_port(self):
         self._list_write(p.listWritePort, self._port_bits)
 
     def list_mark_current(self, current: int):
+        """Raw 12-bit power value (0-4095); always queued. power() takes percent."""
+        if not (_is_whole(current) and 0 <= current <= 0xFFF):
+            raise ValueError("mark current must be a whole number from 0 to 4095")
         self._list_write(p.listMarkCurrent, current)
 
     def list_qswitch_period(self, period: int):
         self._list_write(p.listQSwitchPeriod, period)
 
     def list_fiber_ylpm_pulse_width(self, pulse_width_ns: int) -> bool:
-        """MOPA pulse width in ns (sent as-is, as MeerK40t does; JPT takes ns)."""
-        if self._pulse_width == pulse_width_ns:
-            return False
-        self._pulse_width = pulse_width_ns
-        self._list_write(p.listFiberYLPMPulseWidth, pulse_width_ns)
-        return True
+        """MOPA pulse width in ns (sent as-is, as MeerK40t does; JPT takes ns).
+        Skipped if the list already has it; True if queued."""
+        return self._list_setting(p.listFiberYLPMPulseWidth, pulse_width_ns)
 
     def list_ready(self):
         self._list_write(p.listReadyMark)
@@ -794,7 +890,7 @@ class GalvoController:
 
     def get_serial_number(self) -> bytes:
         cmd = struct.pack("<6H", p.GetSerialNo, 0, 0, 0, 0, 0)
-        return bytes(self._send(cmd))
+        return _reply(self._send(cmd))
 
     def get_list_status(self):
         return self._command(p.GetListStatus)
@@ -803,7 +899,10 @@ class GalvoController:
         return self._command(p.GetPositionXY)
 
     def goto_xy(self, x: int, y: int):
-        """Move the galvos immediately (outside any list)."""
+        """Move the galvos immediately. Only between lists (rapid mode): inside
+        one it would move them under the list being built."""
+        if self.mode != STATE_RAPID:
+            raise RuntimeError("goto_xy moves the galvos at once: call rapid_mode() first")
         self._check(x, y)
         distance = self._distance(x, y)
         self._last_x, self._last_y = x, y

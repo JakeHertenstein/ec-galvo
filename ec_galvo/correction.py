@@ -42,7 +42,13 @@ def _encode(v: float) -> int:
 
 @dataclass(frozen=True)
 class CorrectionTable:
-    """65 x 65 grid of (dx, dy) already encoded for the board."""
+    """65 x 65 grid of (dx, dy) already encoded for the board.
+
+    scale is the number the file's header carries (float layout: header double
+    43). The driver does not use it. MeerK40t reads it as board units per mm and
+    sets the lens size to 65536 / scale mm when a .cor is chosen; see
+    field_size_mm. That reading is not yet confirmed on a real lens file.
+    """
 
     entries: tuple[tuple[int, int], ...]
     scale: float | None = None
@@ -51,6 +57,17 @@ class CorrectionTable:
     def __post_init__(self):
         if not self.blank and len(self.entries) != POINTS:
             raise CorrectionFileError(f"expected {POINTS} entries, got {len(self.entries)}")
+
+    @property
+    def field_size_mm(self) -> float | None:
+        """The lens field size the file was made for, read as MeerK40t does
+        (65536 / scale), or None if scale is missing, zero, negative or not a
+        number. Compare it with Field.size_mm before trusting a lens file, once
+        a real file has confirmed this reading."""
+        if self.scale is None or not (math.isfinite(self.scale) and self.scale > 0):
+            return None
+        size = 65536.0 / self.scale
+        return size if math.isfinite(size) else None
 
     @classmethod
     def no_correction(cls) -> CorrectionTable:

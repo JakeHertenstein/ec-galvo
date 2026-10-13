@@ -2,7 +2,8 @@
 
 The board addresses the lens field as 0..0xFFFF on each axis. As in MeerK40t,
 the full range spans the lens field size, (0, 0) is one corner, and
-flip/swap options match how the galvos are wired.
+flip/swap options match how the galvos are wired. Flips are applied before the
+swap, in MeerK40t's order (see Field).
 """
 
 from __future__ import annotations
@@ -19,6 +20,16 @@ class OutOfFieldError(ValueError):
 
 @dataclass(frozen=True)
 class Field:
+    """The lens field, and how mm map to board units.
+
+    to_board adds offset_mm, then mirrors the x given (flip_x) and the y given
+    (flip_y), and only then swaps x and y. This is MeerK40t's
+    order (its View.transform, which balormk uses). The order matters only with
+    swap_xy and exactly one flip: the other order turns the result 180 degrees
+    about the field centre. Confirm a new machine's values by framing an
+    off-centre, asymmetric L shape, not a centred box.
+    """
+
     size_mm: float
     flip_x: bool = False
     flip_y: bool = False
@@ -41,12 +52,12 @@ class Field:
         """Map a point in mm to board units. Raises OutOfFieldError, never clips."""
         x = x_mm + self.offset_mm[0]
         y = y_mm + self.offset_mm[1]
-        if self.swap_xy:
-            x, y = y, x
         if self.flip_x:
             x = self.size_mm - x
         if self.flip_y:
             y = self.size_mm - y
+        if self.swap_xy:  # after the flips, as in MeerK40t
+            x, y = y, x
         fx, fy = x * self.units_per_mm, y * self.units_per_mm
         if not (math.isfinite(fx) and math.isfinite(fy)):
             raise OutOfFieldError("point is outside the lens field")

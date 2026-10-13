@@ -86,15 +86,21 @@ class USBConnection:
 
         if self._device is None:
             return
+        device = self._device
         try:
-            usb.util.release_interface(self._device, self._interface)
-            usb.util.dispose_resources(self._device)
+            usb.util.release_interface(device, self._interface)
         except usb.core.USBError as e:
             self._log(f"close: {e}")
         finally:
-            self._device = None
-            self._interface = None
-            self._log("USB disconnected")
+            # Even if releasing failed: free the handle so the board can be opened again.
+            try:
+                usb.util.dispose_resources(device)
+            except usb.core.USBError as e:
+                self._log(f"close: {e}")
+            finally:
+                self._device = None
+                self._interface = None
+                self._log("USB disconnected")
 
     def is_open(self) -> bool:
         return self._device is not None
@@ -106,9 +112,11 @@ class USBConnection:
         if self._device is None:
             raise ConnectionError("not connected")
         try:
-            self._device.write(WRITE_ENDPOINT, packet, self.timeout_ms)
+            sent = self._device.write(WRITE_ENDPOINT, packet, self.timeout_ms)
         except usb.core.USBError as e:
             raise ConnectionError(f"USB write failed: {e}") from e
+        if sent != len(packet):
+            raise ConnectionError(f"USB write sent {sent} of {len(packet)} bytes")
 
     def read(self) -> bytes:
         import usb.core

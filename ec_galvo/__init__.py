@@ -17,7 +17,9 @@ from .correction import CorrectionFileError, CorrectionTable
 from .recording import RecordingConnection
 from .units import Field, OutOfFieldError
 
-__version__ = "0.1.0"
+# Bump in any change that alters what is sent to the board (burner records it
+# with every card).
+__version__ = "0.2.0"
 
 __all__ = [
     "AbortIncomplete",

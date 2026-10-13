@@ -1,4 +1,5 @@
 import math
+import struct
 
 import pytest
 from hypothesis import given
@@ -40,8 +41,23 @@ def make(correction=None, logs=None, **kw):
     return c, conn
 
 
-def list_cmds(conn, opcode):
-    return [c for c in conn.commands() if c.in_list and c.opcode == opcode]
+def list_cmds(conn, opcode, start=0):
+    cmds = RecordingConnection(packets=conn.packets[start:]).commands()
+    return [c for c in cmds if c.in_list and c.opcode == opcode]
+
+
+def singles(conn, start=0):
+    """What reached the board from packet `start` on: single-command names, with
+    the value for WritePort and Fiber_SetMo, and "list" for each list packet."""
+    out = []
+    for pk in conn.packets[start:]:
+        if len(pk) == p.PACKET_LIST:
+            out.append("list")
+            continue
+        op, v = struct.unpack_from("<2H", pk)
+        name = p.single_command_lookup[op]
+        out.append(f"{name} {v}" if op in (p.WritePort, p.Fiber_SetMo) else name)
+    return out
 
 
 def test_connect_sends_startup_sequence_in_order():
@@ -67,8 +83,13 @@ def test_correction_table_is_written_line_by_line():
 
 
 def test_wrong_serial_refuses_and_closes():
-    with pytest.raises(ConnectionRefusedError):
-        make(expected_serial=b"OTHERBRD")
+    conn = RecordingConnection()
+    c = GalvoController(
+        conn, Field(150.0), CorrectionTable.no_correction(), expected_serial=b"OTHERBRD"
+    )
+    with pytest.raises(ConnectionRefusedError, match="serial number does not match"):
+        c.connect()
+    assert not conn.is_open()
 
 
 def test_pulse_width_is_sent_and_resent_on_every_new_list():
@@ -204,15 +225,47 @@ def test_light_mode_sets_its_own_jump_speed():
     assert speed.params[0] == c.field.speed(c.setup.light_speed_mm_s)
 
 
-def test_light_then_program_switches_back_to_job_jump_speed():
+def test_switching_between_framing_and_marking_needs_rapid_mode():
+    # Framing to marking in one list: the marks would run with the framing list's
+    # port bits (red dot on, main bit off). Marking to framing: the queued marks
+    # would run after the MO closed. Neither is queued; nothing is sent.
     c, conn = make()
     c.light_mode()
     c.light_mm(10, 10)
-    c.program_mode()
-    c.jump_mm(20, 20)
+    n = len(conn.packets)
+    with pytest.raises(RuntimeError, match="rapid_mode"):
+        c.program_mode()
+    assert c.mode == "light" and len(conn.packets) == n
     c.rapid_mode()
-    speeds = [s.params[0] for s in list_cmds(conn, p.listJumpSpeed)]
-    assert speeds == [c.field.speed(3000.0), c.field.speed(2000.0)]
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.jump_mm(20, 20)
+    c.mark_mm(30, 20)
+    n = len(conn.packets)
+    with pytest.raises(RuntimeError, match="rapid_mode"):
+        c.light_mode()
+    assert c.mode == "program" and len(conn.packets) == n
+    c.rapid_mode()
+
+
+def test_framing_then_marking_list_has_the_main_bit_only():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.rapid_mode()
+    start = len(conn.packets)
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.jump_mm(20, 20)
+    c.mark_mm(30, 20)
+    c.rapid_mode()
+    assert [w.params[0] for w in list_cmds(conn, p.listWritePort, start)] == [1]
+    assert [s for s in singles(conn, start) if s.startswith("WritePort")] == [
+        "WritePort 1",
+        "WritePort 0",
+    ]
+    speeds = [s.params[0] for s in list_cmds(conn, p.listJumpSpeed, start)]
+    assert speeds[0] == c.field.speed(c.setup.default_jump_speed_mm_s)
 
 
 def test_red_dot_is_off_after_framing_and_in_the_next_job():
@@ -442,6 +495,7 @@ def test_abort_does_not_hang_on_a_board_that_stays_busy(monkeypatch):
     c.program_mode()
     c.goto(1000, 1000)
     c.mark(2000, 1000)
+    c.stop_check = lambda: True  # ignored while aborting: every step still runs
     monkeypatch.setattr(c, "status", lambda: p.BUSY)
     with pytest.raises(AbortIncomplete, match="flush list"):
         c.abort()
@@ -588,3 +642,420 @@ def test_huge_numbers_raise_plain_errors_not_overflow():
     for khz in (5e-324, float("inf"), float("nan")):
         with pytest.raises(ValueError):
             qswitch_period(khz)
+
+
+# --- flips and swap --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flip_x", "flip_y", "swap_xy", "expected"),
+    [
+        (False, False, False, (4369, 13107)),
+        (False, False, True, (13107, 4369)),
+        (False, True, False, (4369, 52428)),
+        (False, True, True, (52428, 4369)),
+        (True, False, False, (61166, 13107)),
+        (True, False, True, (13107, 61166)),
+        (True, True, False, (61166, 52428)),
+        (True, True, True, (52428, 61166)),
+    ],
+)
+def test_flips_then_swap_as_meerk40t(flip_x, flip_y, swap_xy, expected):
+    # Upstream: meerk40t.core.view.View("150mm", "150mm", native_scale = 150 mm /
+    # 0xFFFF), .transform(flip_x=, flip_y=, swap_xy=), .position("10mm", "30mm"),
+    # rounded. (10, 30) is off-centre and off the diagonal, so all 8 differ.
+    field = Field(150.0, flip_x=flip_x, flip_y=flip_y, swap_xy=swap_xy)
+    assert field.to_board(10, 30) == expected
+
+
+# --- modes ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.goto(1000, 1000),
+        lambda c: c.goto(1000, 1000, force=True),
+        lambda c: c.jump_mm(10, 10),
+        lambda c: c.light(1000, 1000),
+        lambda c: c.light_mm(10, 10),
+        lambda c: c.dark(1000, 1000),
+        lambda c: c.set_settings(LAYER),
+        lambda c: c.power(40),
+        lambda c: c.frequency(60),
+        lambda c: c.list_jump(1000, 1000),
+        lambda c: c.list_delay_time(10),
+        lambda c: c.list_jump_speed(2000),
+        lambda c: c.list_mark_speed(2000),
+        lambda c: c.list_laser_on_delay(100),
+        lambda c: c.list_polygon_delay(50),
+        lambda c: c.list_fiber_ylpm_pulse_width(200),
+        lambda c: c.list_mark_current(100),
+        lambda c: c.list_laser_on_point(10),
+        lambda c: c.list_write_port(),
+        lambda c: c.list_ready(),
+        lambda c: c.list_end_of_list(),
+    ],
+)
+def test_list_calls_need_an_open_list(call):
+    # Outside a list they used to wait in the driver and run at the start of the
+    # next job, ahead of its settings and with the MO already open.
+    c, conn = make()
+    for _ in range(2):  # straight after connecting, and after a job
+        with pytest.raises(RuntimeError, match="no list open"):
+            call(c)
+        assert c._port_bits == 0
+        start = len(conn.packets)
+        c.program_mode()
+        c.set_settings(LAYER)
+        c.goto(5000, 5000, force=True)
+        c.mark(6000, 5000)
+        c.rapid_mode()
+        names = [x.name for x in RecordingConnection(packets=conn.packets[start:]).commands()]
+        assert [n for n in names if n.startswith("list")][:4] == [
+            "listReadyMark",
+            "listDelayTime",
+            "listWritePort",
+            "listJumpSpeed",
+        ]
+        assert names.count("listJumpTo") == 1 and names.count("listMarkTo") == 1
+
+
+def test_marks_need_a_marking_list():
+    c, conn = make()
+    for mode in (None, "light"):
+        if mode == "light":
+            c.light_mode()
+            c.light(1000, 1000)
+        for call in (lambda: c.mark(2000, 2000), lambda: c.list_mark(2000, 2000)):
+            with pytest.raises(RuntimeError, match="marks need a marking list"):
+                call()
+    c.rapid_mode()
+    assert list_cmds(conn, p.listMarkTo) == []
+
+
+def test_goto_xy_only_between_lists():
+    c, conn = make()
+    c.goto_xy(1000, 1000)
+    for enter in (c.program_mode, c.light_mode):
+        enter()
+        n = len(conn.packets)
+        with pytest.raises(RuntimeError, match="rapid_mode"):
+            c.goto_xy(30000, 30000)
+        assert len(conn.packets) == n
+        c.rapid_mode()
+
+
+def test_abort_from_rapid_mode_still_sends_its_flush_list():
+    c, conn = make()
+    start = len(conn.packets)
+    c.abort()
+    assert singles(conn, start) == [
+        "StopExecute",
+        "Fiber_SetMo 0",
+        "ResetList",
+        "GetVersion",
+        "list",
+        "SetEndOfList",
+        "ExecuteList",
+        "Fiber_SetMo 0",
+        "WritePort 0",
+    ]
+
+
+# --- what reaches the board, in order -------------------------------------------
+
+
+def test_command_order_through_frame_job_second_job_and_abort():
+    c, conn = make()
+    start = len(conn.packets)
+    c.light_mode()
+    for pt in [(10, 10), (60, 10), (60, 60), (10, 60), (10, 10)]:
+        c.light_mm(*pt)
+    c.rapid_mode()
+    frame = singles(conn, start)
+    assert frame == [
+        "ResetList",
+        "GetVersion",  # ready for a list packet?
+        "list",
+        "SetEndOfList",
+        "ExecuteList",  # short list: run at the end
+        "GetVersion",  # wait for it to finish
+        "Fiber_SetMo 0",
+        "WritePort 0",
+    ]
+
+    # A job of 5 list packets: 14 entries of start-up, settings and the first
+    # jump, then 1100 marks, then the end of the list.
+    start = len(conn.packets)
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.goto(1000, 1000)
+    for i in range(1, 1101):
+        c.mark(1000 + i, 1000 + (i % 2))
+    c.rapid_mode()
+    packet = ["GetVersion", "list", "SetEndOfList"]
+    assert singles(conn, start) == [
+        "ResetList",
+        "WritePort 1",
+        "Fiber_SetMo 1",
+        *packet,
+        *packet,
+        *packet,
+        "ExecuteList",  # after the third packet, once
+        *packet,
+        *packet,
+        "GetVersion",
+        "Fiber_SetMo 0",
+        "WritePort 0",
+    ]
+
+    # A second job, aborted while its list runs (3 packets sent and executing).
+    start = len(conn.packets)
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.goto(1000, 1000, force=True)
+    for i in range(1, 801):
+        c.mark(1000 + i, 1000 + (i % 2))
+    c.abort()
+    assert singles(conn, start) == [
+        "ResetList",
+        "WritePort 1",
+        "Fiber_SetMo 1",
+        *packet,
+        *packet,
+        *packet,
+        "ExecuteList",
+        "StopExecute",
+        "Fiber_SetMo 0",
+        "ResetList",
+        *packet,  # the flush list (as upstream, not started again: one was running)
+        "Fiber_SetMo 0",
+        "WritePort 0",
+    ]
+    assert c.mode == "rapid" and c.get_last_xy() == (None, None)
+
+
+def test_rapid_mode_waits_for_a_busy_board_before_closing_the_mo():
+    c, conn = make()
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.goto(1000, 1000)
+    c.mark(2000, 1000)
+    conn.status_script.extend([p.READY, p.BUSY | p.READY, p.BUSY | p.READY, p.BUSY, p.READY])
+    start = len(conn.packets)
+    c.rapid_mode()
+    assert not conn.status_script
+    assert singles(conn, start) == [
+        "GetVersion",
+        "list",
+        "SetEndOfList",
+        "ExecuteList",
+        *["GetVersion"] * 4,  # three busy, then idle
+        "Fiber_SetMo 0",
+        "WritePort 0",
+    ]
+
+
+def test_pause_and_resume():
+    c, conn = make()
+    c.program_mode()
+    start = len(conn.packets)
+    c.pause()
+    assert c.paused
+    c.resume()
+    assert not c.paused
+    assert singles(conn, start) == ["StopList", "RestartList"]
+
+
+def test_abort_while_framing_turns_the_red_dot_off():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.abort()
+    assert singles(conn)[-2:] == ["Fiber_SetMo 0", "WritePort 0"]
+
+
+# --- settings that fail, reconnects, odd values ---------------------------------
+
+
+def test_layer_the_board_cant_run_queues_nothing_and_fails_again():
+    c, conn = make()
+    c.program_mode()
+    c.set_settings(LAYER)
+    slow = MarkSettings(**{**LAYER.__dict__, "speed_mm_s": 2.0, "pulse_width_ns": 4})
+    for _ in range(2):  # not remembered as sent
+        with pytest.raises(ValueError, match="outside what the board can express"):
+            c.set_settings(slow)
+    c.jump_mm(10, 10)
+    c.mark_mm(20, 10)
+    c.rapid_mode()
+    assert [x.params[0] for x in list_cmds(conn, p.listMarkSpeed)] == [655]
+    assert [x.params[0] for x in list_cmds(conn, p.listFiberYLPMPulseWidth)] == [200]
+
+
+def test_failed_settings_are_not_remembered():
+    c, conn = make()
+    c.program_mode()
+    for _ in range(2):
+        for call in (
+            lambda: c.list_jump_speed(1.0),
+            lambda: c.list_mark_speed(1.0),
+            lambda: c.list_laser_on_delay(float("inf")),
+            lambda: c.list_laser_off_delay(float("nan")),
+            lambda: c.list_polygon_delay(float("inf")),
+            lambda: c.list_fiber_ylpm_pulse_width(4.5),
+            lambda: c.power(101),
+            lambda: c.frequency(0),
+        ):
+            with pytest.raises(ValueError):
+                call()
+
+
+def test_a_setting_is_remembered_only_once_queued():
+    from ec_galvo import StopRequested
+
+    c, conn = make()
+    c.program_mode()
+    for i in range(256 - 4):  # fill the first packet exactly
+        c.goto(1000 + i, 1000)
+    c.paused = True
+    c.stop_check = lambda: True
+    with pytest.raises(StopRequested):  # sending the full packet waits on the pause
+        c.list_mark_speed(1500)
+    c.paused = False
+    c.stop_check = None
+    c.list_mark_speed(1500)  # not skipped: the first one never made it into the list
+    c.rapid_mode()
+    assert [x.params[0] for x in list_cmds(conn, p.listMarkSpeed)] == [655]
+
+
+def test_settings_are_compared_as_the_board_gets_them():
+    c, conn = make()
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.field = Field(100.0)  # same mm/s, different board value
+    c.set_settings(LAYER)
+    c.rapid_mode()
+    assert [x.params[0] for x in list_cmds(conn, p.listMarkSpeed)] == [
+        Field(150.0).speed(1500),
+        Field(100.0).speed(1500),
+    ]
+
+
+def test_reconnect_after_framing_clears_the_red_dot():
+    c, conn = make()
+    c.light_mode()
+    c.light_mm(10, 10)
+    c.disconnect()  # no rapid_mode or abort, e.g. after an error
+    c.connect()
+    assert c._port_bits == 0  # the board was just reset
+    start = len(conn.packets)
+    c.program_mode()
+    c.set_settings(LAYER)
+    c.jump_mm(20, 20)
+    c.mark_mm(30, 20)
+    c.rapid_mode()
+    assert [s for s in singles(conn, start) if s.startswith("WritePort")] == [
+        "WritePort 1",
+        "WritePort 0",
+    ]
+    assert [w.params[0] for w in list_cmds(conn, p.listWritePort, start)] == [1]
+
+
+def test_board_setup_speed_the_field_cant_express_fails_before_anything_is_sent():
+    from ec_galvo import BoardSetup
+
+    conn = RecordingConnection()
+    for name in ("default_jump_speed_mm_s", "light_speed_mm_s"):
+        with pytest.raises(ValueError, match=name):
+            GalvoController(
+                conn,
+                Field(150.0),
+                CorrectionTable.no_correction(),
+                setup=BoardSetup(**{name: 1.0}),
+            )
+    assert conn.packets == []
+
+
+def test_mode_change_with_a_field_that_cant_express_the_jump_speed_sends_nothing():
+    c, conn = make()
+    c.field = Field(200000.0)  # 2000 and 3000 mm/s are under one board unit per ms here
+    n = len(conn.packets)
+    for enter in (c.program_mode, c.light_mode):
+        with pytest.raises(ValueError):
+            enter()
+        assert c.mode == "rapid" and len(conn.packets) == n
+
+
+def test_abort_keeps_the_stop_check():
+    c, _ = make()
+    c.program_mode()
+    c.goto(1000, 1000)
+    c.mark(2000, 1000)
+
+    def stop():
+        return True
+
+    c.stop_check = stop
+    c.abort()  # its own waits ignore the stop check
+    assert c.stop_check is stop
+
+
+def test_board_unit_calls_refuse_fractions_and_out_of_range_values():
+    c, conn = make()
+    c.program_mode()
+    c.goto(1000.0, 2000.0)  # whole numbers as floats are fine
+    for bad in [(1000.9, 2000.0), (1000, 2000.2), (70000, 0), (-1, 0), (math.inf, 0)]:
+        for call in (c.goto, c.list_jump, c.mark):
+            with pytest.raises(ValueError):
+                call(*bad)
+    for call in (
+        lambda: c.list_laser_on_point(1.9),
+        lambda: c.list_laser_on_point(70000),
+        lambda: c.list_delay_time(math.inf),
+        lambda: c.list_mark_current(5000),
+        lambda: c.list_qswitch_period(-1),
+        lambda: c.list_jump_delay(math.nan),
+        lambda: c.set_standby(1.5, 0),
+    ):
+        with pytest.raises(ValueError):
+            call()
+    c.rapid_mode()
+    with pytest.raises(ValueError):
+        c.goto_xy(1000.5, 0)
+    jumps = [j.params[:2] for j in list_cmds(conn, p.listJumpTo)]
+    assert jumps == [(1000, 2000)]
+
+
+def test_bad_board_value_errors_name_the_command_not_the_value():
+    c, _ = make()
+    c.program_mode()
+    with pytest.raises(ValueError) as e:
+        c.list_laser_on_point(12345.5)
+    assert "listLaserOnPoint" in str(e.value) and "12345" not in str(e.value)
+    with pytest.raises(ValueError) as e:
+        c.goto(23456.5, 100)
+    assert "23456" not in str(e.value)
+
+
+@pytest.mark.parametrize("reply", [b"\0" * 4, b"", b"\0" * 9])
+def test_wrong_length_reply_is_a_connection_error(reply):
+    c, conn = make()
+    c.program_mode()
+    c.goto(1000, 1000)
+    conn.replies.append(reply)
+    with pytest.raises(ConnectionError, match=f"reply was {len(reply)} bytes, expected 8"):
+        c.rapid_mode()
+
+
+def test_short_serial_reply_is_a_connection_error_not_a_mismatch():
+    conn = RecordingConnection()
+    conn.replies.append(b"RECO")
+    c = GalvoController(
+        conn, Field(150.0), CorrectionTable.no_correction(), expected_serial=b"RECORDER"
+    )
+    with pytest.raises(ConnectionError, match="reply was 4 bytes") as e:
+        c.connect()
+    assert not isinstance(e.value, ConnectionRefusedError)
+    assert not conn.is_open()
